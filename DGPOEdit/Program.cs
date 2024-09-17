@@ -2,9 +2,12 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 
 namespace DGPOEdit {
     internal class Program {
+
 
         static string AddQuotesIfNeeded(string arg) {
             if (arg.StartsWith("/gpobject"))
@@ -14,29 +17,43 @@ namespace DGPOEdit {
         }
 
         static void Main(string[] args) {
-
+          
             string targetDomain = null;
             string channelName = null;
             string commandLine;
             string domainController = "";
 
             if (args.Length >= 2) {
-                commandLine = args.Aggregate(@"""C:\WINDOWS\SYSTEM32\GPME.MSC""",
-                    (current, next) => $@"{current} {AddQuotesIfNeeded(next)}");
 
                 if (args[1].ToLower().StartsWith("/gpobject:")) {
+
+                    commandLine = args.Aggregate(@"""C:\WINDOWS\SYSTEM32\GPME.MSC""",
+                    (current, next) => $@"{current} {AddQuotesIfNeeded(next)}");
+                
                     Uri uri = new Uri(args[1].Substring(10));
                     domainController = uri.Host;
                     targetDomain = domainController.Substring(domainController.IndexOf('.') + 1);
-                }
 
-                Console.WriteLine($"[=] Detected GPO edit action - DC={domainController}, TargetDomain={targetDomain}");
+                    Console.WriteLine($"[=] Detected GPO edit action - DC={domainController}, TargetDomain={targetDomain}");
 
-            }else if(args.Length == 1){
-                commandLine = @"""C:\WINDOWS\SYSTEM32\GPMC.MSC""";
-                targetDomain = args[0];
+                } else{
+
+                    targetDomain = args[1];
+
+                    if (args[0] == "cert") {
+                        commandLine = commandLine = @"""C:\WINDOWS\SYSTEM32\certsrv.msc""";
+                    } else if(args[0] == "gpo") {
+                        commandLine = @"""C:\WINDOWS\SYSTEM32\GPMC.MSC""";
+                    } else if (args[0] == "template") {
+                        commandLine = @"""C:\WINDOWS\SYSTEM32\certtmpl.msc""";
+                    } else {
+                        Console.WriteLine("[!] Usage: DGPOEdit cert|gpo|template target_domain");
+                        return;
+                    }
+                }                
+            
             } else {
-                Console.WriteLine("[!] Usage: DGPOEdit target_domain");
+                Console.WriteLine("[!] Usage: DGPOEdit cert|gpo|template target_domain");
                 return;
             }
 
