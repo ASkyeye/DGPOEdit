@@ -2,10 +2,8 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 
-namespace DGPOEdit {
+namespace DRSAT {
     internal class Program {
 
 
@@ -35,7 +33,7 @@ namespace DGPOEdit {
                     targetDomain = domainController.Substring(domainController.IndexOf('.') + 1);
 
                     Console.WriteLine($"[=] Detected GPO edit action - DC={domainController}, TargetDomain={targetDomain}");
-
+                    
                 } else{
 
                     targetDomain = args[1];
@@ -47,19 +45,19 @@ namespace DGPOEdit {
                     } else if (args[0] == "template") {
                         commandLine = @"""C:\WINDOWS\SYSTEM32\certtmpl.msc""";
                     } else {
-                        Console.WriteLine("[!] Usage: DGPOEdit cert|gpo|template target_domain");
+                        Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain");
                         return;
                     }
                 }                
             
             } else {
-                Console.WriteLine("[!] Usage: DGPOEdit cert|gpo|template target_domain");
+                Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain");
                 return;
             }
 
-            EasyHook.RemoteHooking.IpcCreateServer<DGPOHook.ServerRpc>(ref channelName, System.Runtime.Remoting.WellKnownObjectMode.Singleton);
+            EasyHook.RemoteHooking.IpcCreateServer<DRSATHook.ServerRpc>(ref channelName, System.Runtime.Remoting.WellKnownObjectMode.Singleton);
             
-            string injectionLibrary = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "DGPOHook.dll");
+            string injectionLibrary = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "DRSATHook.dll");
 
             EasyHook.RemoteHooking.CreateAndInject(@"c:\windows\system32\mmc.exe", commandLine, 0, EasyHook.InjectionOptions.DoNotRequireStrongName,
                 injectionLibrary, injectionLibrary, out var targetPID, new object[] { targetDomain, domainController, channelName });

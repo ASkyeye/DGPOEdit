@@ -1,8 +1,14 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.DirectoryServices;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Security.Cryptography;
+using System.Security.Policy;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -11,7 +17,7 @@ using EasyHook;
 
 using static EasyHook.RemoteHooking;
 
-namespace DGPOHook {
+namespace DRSATHook {
 
     public enum ExtendedNameFormat {
         NameUnknown = 0,
@@ -68,7 +74,7 @@ namespace DGPOHook {
     public class ServerRpc : MarshalByRefObject  {
 
         public void IsInstalled(int clientPID) {
-            Console.WriteLine($"DGPOEdit has injected hooks into process {clientPID}.\r\n");
+            Console.WriteLine($"DRSAT has injected hooks into process {clientPID}.\r\n");
         }
  
         public void ReportMessage(int clientPID, string message) {
@@ -83,13 +89,17 @@ namespace DGPOHook {
         }
     }
 
-    public class DGPOHook : IEntryPoint {
+    public class DRSATHook : IEntryPoint {
 
         static Regex ldapPattern = new Regex("^LDAP:\\/\\/([^\\/]+)([\\/]?[^\\/]+)?");
         string TargetDomain;
+        string TargetDomainName;
+        Guid TargetDomainGuid;
+        SecurityIdentifier TargetDomainSid;
         string DomainController;
         ServerRpc Server;
         string LastMessage = null;
+        HashSet<IntPtr> managedMemory = new HashSet<IntPtr>();
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError=true)]
         delegate bool GetUserNameEx_Delegate(ExtendedNameFormat nameFormat, IntPtr userNamePtr, ref int userNameSize);
@@ -113,6 +123,12 @@ namespace DGPOHook {
         [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
         delegate bool LookupAccountSidW_Delegate(string lpSystemName, [MarshalAs(UnmanagedType.LPArray)] byte[] Sid, IntPtr lpName, ref uint cchName,
                                                 IntPtr ReferencedDomainName, ref uint cchReferencedDomainName, out uint peUse);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
+        delegate uint LsaQueryInformationPolicy_Delegate(IntPtr PolicyHandle, uint InformationClass, out IntPtr Buffer);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
+        delegate uint LsaFreeMemory_Delegate(IntPtr Buffer);
 
 
         [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
@@ -150,6 +166,13 @@ namespace DGPOHook {
         static extern bool LookupAccountSidW(string lpSystemName,[MarshalAs(UnmanagedType.LPArray)] byte[] Sid, IntPtr lpName, ref uint cchName,
                                                 IntPtr ReferencedDomainName,ref uint cchReferencedDomainName, out uint peUse);
 
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint LsaQueryInformationPolicy(IntPtr PolicyHandle, uint InformationClass, out IntPtr Buffer);
+
+        [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint LsaFreeMemory(IntPtr Buffer);
+
+
         [StructLayout(LayoutKind.Sequential, Pack = 0)]
         public struct IO_STATUS_BLOCK {
             public uint status;
@@ -168,14 +191,44 @@ namespace DGPOHook {
         }
 
         [StructLayout(LayoutKind.Sequential, Pack = 0)]
-        public struct UNICODE_STRING {
+        public class UNICODE_STRING { 
             public ushort Length;
             public ushort MaximumLength;
             public IntPtr Buffer;
+            
+            public UNICODE_STRING() {
 
+            }
+
+            public UNICODE_STRING(string value) {
+                var strData = Encoding.Unicode.GetBytes(value);
+                Buffer = Marshal.AllocHGlobal(strData.Length + 2);
+                Length = (ushort)strData.Length;
+                MaximumLength = (ushort)strData.Length;
+                Marshal.Copy(strData,0, Buffer, strData.Length);
+            }
+
+
+            //Dont implement IDisposable since this class can be used
+            //for allocating a unicode string using a managed string
+            //or parse a native UNICODE_STRING structre which wont
+            //be manaaged memory
+            public void Dispose() {
+                if (Buffer != IntPtr.Zero)
+                    Marshal.FreeHGlobal(Buffer);
+            }
         }
 
-        public DGPOHook(IContext ctx, string domain, string domainController, string channelName) {
+        [StructLayout(LayoutKind.Sequential, Pack = 0)]
+        struct POLICY_DNS_DOMAIN_INFO {
+            public UNICODE_STRING Name;
+            public UNICODE_STRING DnsDomainName;
+            public UNICODE_STRING DnsForestName;
+            public Guid DomainGuid;
+            public byte[] Sid;
+        }
+
+        public DRSATHook(IContext ctx, string domain, string domainController, string channelName) {
             TargetDomain = domain;
             DomainController = domainController;
 
@@ -206,7 +259,7 @@ namespace DGPOHook {
                 var objName = Marshal.PtrToStructure<UNICODE_STRING>(objectAttributes.ObjectName);
                 var rawName = new byte[objName.Length];
                 Marshal.Copy(objName.Buffer, rawName,0, objName.Length);
-                var path = Encoding.Unicode.GetString(rawName);
+                var path = Encoding.Unicode.GetString(rawName, 0, objName.Length);
 
                 if (GetRedirectedFileName(ref path)) {
 
@@ -241,9 +294,9 @@ namespace DGPOHook {
                 var managedFileName = Marshal.PtrToStringUni(lpFileOrig);
                      
                 if (managedFileName == "gpme.msc") {
-                    lpExecInfo.lpFile = Marshal.StringToHGlobalUni(Path.Combine(Path.GetDirectoryName(Assembly.GetCallingAssembly().Location), "DGPOEdit.exe"));
+                    lpExecInfo.lpFile = Marshal.StringToHGlobalUni(Path.Combine(Path.GetDirectoryName(Assembly.GetCallingAssembly().Location), "DRSAT.exe"));
                 } else if (managedFileName == "certtmpl.msc") {
-                    lpExecInfo.lpFile = Marshal.StringToHGlobalUni(Path.Combine(Path.GetDirectoryName(Assembly.GetCallingAssembly().Location), "DGPOEdit.exe"));
+                    lpExecInfo.lpFile = Marshal.StringToHGlobalUni(Path.Combine(Path.GetDirectoryName(Assembly.GetCallingAssembly().Location), "DRSAT.exe"));
                     lpExecInfo.lpParameters = Marshal.StringToHGlobalUni($"template {TargetDomain}");
                 }
             }
@@ -290,6 +343,9 @@ namespace DGPOHook {
         }
 
         uint DsRoleGetPrimaryDomainInformation_Hook(string lpServer, uint InfoLevel, out IntPtr buffer) {
+            if (lpServer == null) {
+                LastMessage = $"[=] Redirected DsRoleGetPrimaryDomainInformation query to DC {DomainController}";
+            }
             return DsRoleGetPrimaryDomainInformation(lpServer == null ? DomainController : lpServer, InfoLevel, out buffer);
         }
 
@@ -297,13 +353,15 @@ namespace DGPOHook {
 
             if (lpszPathName != null) {
 
-                if (lpszPathName == "LDAP://RootDSE")
+                if (lpszPathName == "LDAP://RootDSE") {
                     lpszPathName = $"LDAP://{DomainController}/RootDSE";
-                else {
+                    LastMessage = $"[=] Redirected LDAP query to {lpszPathName}";
+                } else {
                     var match = ldapPattern.Match(lpszPathName);
                     if (match.Success) {
-                        if (match.Groups[1].Value.Contains("=")){
+                        if (match.Groups[1].Value.Contains("=")) {
                             lpszPathName = $"LDAP://{DomainController}/{match.Groups[1].Value}";
+                            LastMessage = $"[=] Redirected LDAP query to {lpszPathName}";
                         }
                     }
                 }
@@ -313,6 +371,10 @@ namespace DGPOHook {
         }
 
         int DsGetDcNameW_Hook(string ComputerName, string DomainName, IntPtr DomainGuid, string SiteName, int Flags, out IntPtr pDOMAIN_CONTROLLER_INFO) {
+
+            if(ComputerName == null) {
+                LastMessage = $"[=] Redirected DC name query to {DomainController}";
+            }
             return DsGetDcNameW(ComputerName == null ? DomainController : ComputerName, DomainName, DomainGuid, SiteName, Flags, out pDOMAIN_CONTROLLER_INFO);
         }
 
@@ -325,7 +387,57 @@ namespace DGPOHook {
 
         bool LookupAccountSidW_Hook(string lpSystemName, [MarshalAs(UnmanagedType.LPArray)] byte[] Sid, IntPtr lpName, ref uint cchName,
                                                 IntPtr ReferencedDomainName, ref uint cchReferencedDomainName, out uint peUse) {
+
+            if (lpSystemName == null) {
+                LastMessage = $"[=] Redirected AccountLookupSid to DC {DomainController}";
+            } 
             return LookupAccountSidW(lpSystemName == null ? DomainController : lpSystemName, Sid, lpName, ref cchName, ReferencedDomainName, ref cchReferencedDomainName, out peUse);
+        }
+
+        uint LsaQueryInformationPolicy_Hook(IntPtr PolicyHandle, uint InformationClass, out IntPtr Buffer) {
+
+            if (InformationClass == 0xc) {
+
+                var sidBytes = new byte[TargetDomainSid.BinaryLength];
+                TargetDomainSid.GetBinaryForm(sidBytes, 0);
+
+                var dnsDomainInfo = new POLICY_DNS_DOMAIN_INFO {
+                    DomainGuid = TargetDomainGuid,
+                    DnsDomainName = new UNICODE_STRING(TargetDomain),
+                    Name = new UNICODE_STRING(TargetDomainName),
+                    Sid = sidBytes,
+                };
+
+                var nativeDomainInfo = Marshal.AllocHGlobal(Marshal.SizeOf(dnsDomainInfo));
+                Marshal.StructureToPtr(dnsDomainInfo, nativeDomainInfo, false);
+                Buffer = nativeDomainInfo;
+                managedMemory.Add(nativeDomainInfo);
+
+                LastMessage = "[=] Faked domain join info during LsaQueryInformationPolicy call";
+
+                return 0;
+
+            } else {
+                return LsaQueryInformationPolicy(PolicyHandle, InformationClass, out Buffer);
+            }
+        }
+
+        uint LsaFreeMemory_Hook(IntPtr Buffer) {
+
+            if (managedMemory.Contains(Buffer)){
+
+                var dnsDomainInfo = Marshal.PtrToStructure<POLICY_DNS_DOMAIN_INFO>(Buffer);
+
+                dnsDomainInfo.DnsDomainName.Dispose();
+                dnsDomainInfo.DnsForestName.Dispose();
+                dnsDomainInfo.Name.Dispose();
+
+                Marshal.DestroyStructure<POLICY_DNS_DOMAIN_INFO>(Buffer);
+                managedMemory.Remove(Buffer);
+                return 0;
+            } else {
+                return LsaFreeMemory(Buffer);
+            }
         }
 
         public void Run(IContext ctx, string domain, string domainController, string channelName) {
@@ -333,17 +445,26 @@ namespace DGPOHook {
             if (string.IsNullOrEmpty(domainController)) {
 
                 if (DsGetDcNameW(null, domain, IntPtr.Zero, null, 0, out var pDomainInfo) > 0) {
-                    MessageBox.Show($"Failed to get domain controller info for domain {domain}", "DGPOEdit", MessageBoxButtons.OK);
+                    MessageBox.Show($"Failed to get domain controller info for domain {domain}", "DRSAT", MessageBoxButtons.OK);
                     return;
                 }
                                     
                 var domainInfo = Marshal.PtrToStructure<DOMAIN_CONTROLLER_INFO>(pDomainInfo);
-                DomainController = domainInfo.DomainControllerName.Substring(2);                         
+                DomainController = domainInfo.DomainControllerName.Substring(2);
+            } else {
+                DomainController = domainController;
+            }
+
+            using (var de = new DirectoryEntry($"LDAP://{DomainController}")) {
+                TargetDomainGuid = de.Guid;
+                TargetDomainSid = new SecurityIdentifier((byte[])de.InvokeGet("objectSID"), 0);
+                TargetDomainName = ((string)de.InvokeGet("name")).Substring(3);
             }
 
             //pre-load DLL's otherwise EasyHook wont find it
             LoadLibrary("Activeds.dll");
             LoadLibrary("netapi32.dll");
+            LoadLibrary("sechost.dll");
 
             var ntCreateFileHook = (LocalHook)null;
             var getUserNameExHook = CreateHook("sspicli.dll", "GetUserNameExW", new GetUserNameEx_Delegate(GetUserNameEx_Hook));                
@@ -352,9 +473,11 @@ namespace DGPOHook {
             var dsGetDcNameW_Hook = CreateHook("NetApi32.dll", "DsGetDcNameW", new DsGetDcNameW_Delegate(DsGetDcNameW_Hook));
             var lookupAccountSidW_Hook = CreateHook("advapi32.dll", "LookupAccountSidW", new LookupAccountSidW_Delegate(LookupAccountSidW_Hook));
             var shellExecuteExW_Hook = CreateHook("shell32.dll", "ShellExecuteExW", new ShellExecuteExW_Delegate(ShellExecuteExW_Hook));
+            var lsaQueryInformationPolicy_Hook = CreateHook("sechost.dll", "LsaQueryInformationPolicy", new LsaQueryInformationPolicy_Delegate(LsaQueryInformationPolicy_Hook));
+            var lsaFreeMemory_Hook = CreateHook("sechost.dll", "LsaFreeMemory", new LsaFreeMemory_Delegate(LsaFreeMemory_Hook));
 
             if (domainController != "") {
-                ntCreateFileHook = LocalHook.Create(EasyHook.LocalHook.GetProcAddress("ntdll.dll", "NtCreateFile"),
+                ntCreateFileHook = LocalHook.Create(LocalHook.GetProcAddress("ntdll.dll", "NtCreateFile"),
                     new NtCreateFile_Delegate(NtCreateFile_Hook), this);
                 ntCreateFileHook.ThreadACL.SetExclusiveACL(new int[] { 0 });
             }
@@ -382,6 +505,8 @@ namespace DGPOHook {
             dsRoleGetPrimaryDomainInformation_Hook.Dispose();
             adsGetObject_Hook.Dispose();
             lookupAccountSidW_Hook.Dispose();
+            lsaQueryInformationPolicy_Hook.Dispose();
+            lsaFreeMemory_Hook.Dispose();
 
             if (domainController != null) {
                 ntCreateFileHook.Dispose();

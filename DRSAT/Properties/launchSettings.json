@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DRSAT": {
+      "commandName": "Project",
+      "commandLineArgs": "cert ethicalchaos.dev"
+    }
+  }
+}

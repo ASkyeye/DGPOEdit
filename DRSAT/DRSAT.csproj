@@ -11,7 +11,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DGPOHook\DGPOHook.csproj" />
+    <ProjectReference Include="..\DRSATHook\DRSATHook.csproj" />
   </ItemGroup>
 
   <ItemGroup>
