@@ -2,9 +2,9 @@
 
 ## Introduction
 
-Disconnected RSAT is a launcher for the official Group Policy Manager, Certificate Authority and Certificat Templates snap-in to bypass the domain joined requirement that is needed when using the official MMC snap-in.  
+Disconnected RSAT is a launcher for the official Group Policy Manager, Certificate Authority and Certificate Templates snap-in to bypass the domain joined requirement that is needed when using the official MMC snap-in.  
 
-The tool works by injecting a C# library into MMC that will hook the `GetUserNameExW` API calls to trick MMC into believing that the logged on user is a domain user.  Hooks are also placed on the `NtCreateFile` API to redirect file paths that would typically be resolved via DFS to a specific domain controller instead.
+The tool works by injecting a C# library into MMC that will hook the various API calls to trick MMC into believing that the logged on user is a domain user.  Hooks are also placed on the `NtCreateFile` API to redirect file paths that would typically be resolved via DFS to a specific domain controller.
 
 ## Prerequisites  
 
@@ -32,7 +32,7 @@ DRSAT cert ad.target.com
 
 ### Launching Certifictate Template edittor
 
-You can also directly edit certificate templates by usin the following command
+You can also directly edit certificate templates by using the following command
 
 ```
 DRSAT template ad.target.com
