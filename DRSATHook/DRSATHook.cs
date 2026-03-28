@@ -99,6 +99,7 @@ namespace DRSATHook {
         string DomainController;
         ServerRpc Server;
         string LastMessage = null;
+        bool DcExplicit;
         HashSet<IntPtr> managedMemory = new HashSet<IntPtr>();
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError=true)]
@@ -129,6 +130,9 @@ namespace DRSATHook {
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
         delegate uint LsaFreeMemory_Delegate(IntPtr Buffer);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall, SetLastError = true)]
+        delegate int NetApiBufferFree_Delegate(IntPtr Buffer);
 
 
         [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
@@ -171,6 +175,9 @@ namespace DRSATHook {
 
         [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true, CharSet = CharSet.Unicode)]
         static extern uint LsaFreeMemory(IntPtr Buffer);
+
+        [DllImport("Netapi32.dll")]
+        static extern int NetApiBufferFree(IntPtr Buffer);
 
 
         [StructLayout(LayoutKind.Sequential, Pack = 0)]
@@ -370,12 +377,62 @@ namespace DRSATHook {
             return ADsGetObject(lpszPathName, ref riid, out ppObject);
         }
 
+        string ResolveDcViaTcpLdap(string domain) {
+            try {
+                using (var rootDse = new DirectoryEntry($"LDAP://{domain}/RootDSE")) {
+                    return (string)rootDse.Properties["dnsHostName"].Value;
+                }
+            } catch {
+                return null;
+            }
+        }
+
+        int FakeDsGetDcNameW(out IntPtr pDOMAIN_CONTROLLER_INFO) {
+            var dcInfo = new DOMAIN_CONTROLLER_INFO {
+                DomainControllerName = $@"\\{DomainController}",
+                DomainControllerAddress = $@"\\{DomainController}",
+                DomainControllerAddressType = 1,
+                DomainGuid = TargetDomainGuid,
+                DomainName = TargetDomain,
+                DnsForestName = TargetDomain,
+                Flags = 0xE00013FD,
+                DcSiteName = "Default-First-Site-Name",
+                ClientSiteName = "Default-First-Site-Name"
+            };
+
+            pDOMAIN_CONTROLLER_INFO = Marshal.AllocHGlobal(Marshal.SizeOf(dcInfo));
+            Marshal.StructureToPtr(dcInfo, pDOMAIN_CONTROLLER_INFO, false);
+            managedMemory.Add(pDOMAIN_CONTROLLER_INFO);
+            LastMessage = $"[+] Faked DsGetDcNameW response for {DomainController}";
+            return 0;
+        }
+
         int DsGetDcNameW_Hook(string ComputerName, string DomainName, IntPtr DomainGuid, string SiteName, int Flags, out IntPtr pDOMAIN_CONTROLLER_INFO) {
 
-            if(ComputerName == null) {
-                LastMessage = $"[=] Redirected DC name query to {DomainController}";
+            if (ComputerName == null) {
+
+                if (DcExplicit) {
+                    return FakeDsGetDcNameW(out pDOMAIN_CONTROLLER_INFO);
+                }
+
+                var result = DsGetDcNameW(DomainController, DomainName, DomainGuid, SiteName, Flags, out pDOMAIN_CONTROLLER_INFO);
+                if (result == 0) {
+                    LastMessage = $"[=] Redirected DC name query to {DomainController}";
+                    return result;
+                }
+
+                var resolvedDc = ResolveDcViaTcpLdap(DomainName ?? TargetDomain);
+                if (resolvedDc != null) {
+                    DomainController = resolvedDc;
+                    return FakeDsGetDcNameW(out pDOMAIN_CONTROLLER_INFO);
+                }
+
+                LastMessage = $"[!] Failed to resolve DC for {DomainName ?? TargetDomain}";
+                pDOMAIN_CONTROLLER_INFO = IntPtr.Zero;
+                return 1355;
             }
-            return DsGetDcNameW(ComputerName == null ? DomainController : ComputerName, DomainName, DomainGuid, SiteName, Flags, out pDOMAIN_CONTROLLER_INFO);
+
+            return DsGetDcNameW(ComputerName, DomainName, DomainGuid, SiteName, Flags, out pDOMAIN_CONTROLLER_INFO);
         }
 
         LocalHook CreateHook(string dll, string export, Delegate hookFunction) {
@@ -440,18 +497,37 @@ namespace DRSATHook {
             }
         }
 
+        int NetApiBufferFree_Hook(IntPtr Buffer) {
+            if (managedMemory.Contains(Buffer)) {
+                Marshal.DestroyStructure<DOMAIN_CONTROLLER_INFO>(Buffer);
+                Marshal.FreeHGlobal(Buffer);
+                managedMemory.Remove(Buffer);
+                return 0;
+            }
+            return NetApiBufferFree(Buffer);
+        }
+
         public void Run(IContext ctx, string domain, string domainController, string channelName) {
 
             if (string.IsNullOrEmpty(domainController)) {
+                DcExplicit = false;
 
-                if (DsGetDcNameW(null, domain, IntPtr.Zero, null, 0, out var pDomainInfo) > 0) {
-                    MessageBox.Show($"Failed to get domain controller info for domain {domain}", "DRSAT", MessageBoxButtons.OK);
-                    return;
+                if (DsGetDcNameW(null, domain, IntPtr.Zero, null, 0, out var pDomainInfo) == 0) {
+                    var domainInfo = Marshal.PtrToStructure<DOMAIN_CONTROLLER_INFO>(pDomainInfo);
+                    DomainController = domainInfo.DomainControllerName.Substring(2);
+                    Server.ReportMessage(Process.GetCurrentProcess().Id, $"[=] Resolved DC via cLDAP: {DomainController}");
+                } else {
+                    var resolvedDc = ResolveDcViaTcpLdap(domain);
+                    if (resolvedDc != null) {
+                        DomainController = resolvedDc;
+                        Server.ReportMessage(Process.GetCurrentProcess().Id, $"[+] Resolved DC via TCP LDAP: {DomainController}");
+                    } else {
+                        MessageBox.Show($"Failed to locate DC for {domain}. Please supply the DC hostname explicitly.", "DRSAT", MessageBoxButtons.OK);
+                        return;
+                    }
                 }
-                                    
-                var domainInfo = Marshal.PtrToStructure<DOMAIN_CONTROLLER_INFO>(pDomainInfo);
-                DomainController = domainInfo.DomainControllerName.Substring(2);
             } else {
+                DcExplicit = true;
                 DomainController = domainController;
             }
 
@@ -475,6 +551,7 @@ namespace DRSATHook {
             var shellExecuteExW_Hook = CreateHook("shell32.dll", "ShellExecuteExW", new ShellExecuteExW_Delegate(ShellExecuteExW_Hook));
             var lsaQueryInformationPolicy_Hook = CreateHook("sechost.dll", "LsaQueryInformationPolicy", new LsaQueryInformationPolicy_Delegate(LsaQueryInformationPolicy_Hook));
             var lsaFreeMemory_Hook = CreateHook("sechost.dll", "LsaFreeMemory", new LsaFreeMemory_Delegate(LsaFreeMemory_Hook));
+            var netApiBufferFree_Hook = CreateHook("Netapi32.dll", "NetApiBufferFree", new NetApiBufferFree_Delegate(NetApiBufferFree_Hook));
 
             if (domainController != "") {
                 ntCreateFileHook = LocalHook.Create(LocalHook.GetProcAddress("ntdll.dll", "NtCreateFile"),
@@ -507,6 +584,7 @@ namespace DRSATHook {
             lookupAccountSidW_Hook.Dispose();
             lsaQueryInformationPolicy_Hook.Dispose();
             lsaFreeMemory_Hook.Dispose();
+            netApiBufferFree_Hook.Dispose();
 
             if (domainController != null) {
                 ntCreateFileHook.Dispose();

@@ -27,16 +27,21 @@ namespace DRSAT {
 
                     commandLine = args.Aggregate(@"""C:\WINDOWS\SYSTEM32\GPME.MSC""",
                     (current, next) => $@"{current} {AddQuotesIfNeeded(next)}");
-                
+
                     Uri uri = new Uri(args[1].Substring(10));
                     domainController = uri.Host;
                     targetDomain = domainController.Substring(domainController.IndexOf('.') + 1);
 
                     Console.WriteLine($"[=] Detected GPO edit action - DC={domainController}, TargetDomain={targetDomain}");
-                    
+
                 } else{
 
                     targetDomain = args[1];
+
+                    if (args.Length >= 3) {
+                        domainController = args[2];
+                        Console.WriteLine($"[=] Using explicit DC: {domainController}");
+                    }
 
                     if (args[0] == "cert") {
                         commandLine = commandLine = @"""C:\WINDOWS\SYSTEM32\certsrv.msc""";
@@ -45,13 +50,13 @@ namespace DRSAT {
                     } else if (args[0] == "template") {
                         commandLine = @"""C:\WINDOWS\SYSTEM32\certtmpl.msc""";
                     } else {
-                        Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain");
+                        Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain [dc_hostname]");
                         return;
                     }
-                }                
-            
+                }
+
             } else {
-                Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain");
+                Console.WriteLine("[!] Usage: DRSAT cert|gpo|template target_domain [dc_hostname]");
                 return;
             }
 
